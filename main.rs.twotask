@@ -1,0 +1,201 @@
+
+use std::collections::HashMap;
+use std::process;
+
+use tokio::time::Instant;
+
+use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::WriteRequest;
+use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::primitives::Blob;
+//use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemError;
+//use aws_smithy_runtime_api::client::result::SdkError;
+
+use uuid::Uuid;
+
+const DYNAMO_BAT_SIZE : usize = 25;
+
+#[::tokio::main]
+async fn main() {
+      //let mut uuid_store: HashMap<String, Uuid> = HashMap::new();
+
+    let mut bat_w_req : Vec<aws_sdk_dynamodb::types::WriteRequest> = vec![];
+
+    let mut retry_items : u32 = 0;
+    let mut start = Instant::now();
+
+    // create a dynamodb client
+    let config = aws_config::from_env().region("us-east-1").load().await;
+    let dynamo_client = Client::new(&config);
+    
+    let client_1 = dynamo_client.clone();
+    let client_2 = dynamo_client.clone();
+    let table_name = "RustGraph.dev.2";                     
+    let table_name_retry = "RustGraph.dev.1";     
+                        
+    // copy items from retry table to live table. Split between two tokio tasks:  scan-task -> channel -> load-task 
+                        
+    // paginated scan populates batch, then load batch into live table and repeat until last_evaluated_key is None
+     
+    let (datapump_ch, mut datapump_rx) = tokio::sync::mpsc::channel(20); //TODO: try 0,2,3,4,5
+   
+    let mut lek : Option<HashMap<String, AttributeValue>> = None;
+    start = Instant::now();
+                        
+    let scan_task = tokio::spawn(async move {
+        let mut more_items = true;
+        let mut first_time = true;
+        println!("retry scan_task started...");
+                            
+        while more_items {
+                                
+                                //.select() - default to ALL_ATTRIBUTES
+                                let result = if first_time {
+                                        first_time=false;
+                                        client_1
+                                        .scan()
+                                        .table_name(table_name_retry)
+                                        .limit(1000) 
+                                        .send()
+                                        .await
+                                    } else {
+                                         client_1
+                                        .scan()
+                                        .table_name(table_name_retry)
+                                        .set_exclusive_start_key(lek)
+                                        .limit(1000) 
+                                        .send()
+                                        .await                             
+                                    };
+                                
+                                if let Err(err) = result {
+                                    panic!("Error in scan of retries table: {}",err); // TODO replace panic
+                                }
+                                let scan_output = result.unwrap(); 
+                                
+                                //println!("scan_task: sending on datapump_ch");
+                                // send Option<Vec<HashMap<String, AttributeValue>>>
+                                datapump_ch.send(scan_output.items).await;
+
+                                if None == scan_output.last_evaluated_key {
+                                    more_items=false;
+                                } else {
+                                    more_items=true;
+                                }
+                                lek=scan_output.last_evaluated_key;
+                                
+        }
+     
+        0
+    });
+
+    let load_task = tokio::spawn(async move {
+                            println!("retry load_task started...");
+                            loop {
+                            
+                                let items = datapump_rx.recv().await;
+                                //println!("load_task: read from channel...");
+                                // recv() returns None if the channel has been closed and there are no remaining messages in the channel’s buffer.
+                                if None == items {
+                                    println!("retry load_task channel read - None");
+                                    break;
+                                }
+                            
+                                for item in items.unwrap() {
+                                
+                                    // build a put_item
+
+                                    // attributes of item
+                                    for hm in item {
+                                    
+                                        let mut put =  aws_sdk_dynamodb::types::PutRequest::builder();
+                                        for (k,v) in hm {
+                                            if k == "PK" {
+                                                let vv = AttributeValue::B(Blob::new(Uuid::new_v4().as_bytes()));
+                                                put = put.item(k,vv);
+                                            } else {
+                                                put = put.item(k,v);
+                                            }
+                                        }
+                                    
+                                        // build a WriteRequest
+                                        match put.build() {
+                                            Err(err) => {
+                                                println!("error in write_request builder: {}",err);
+                                            }
+                                            
+                                            Ok(req) =>  {
+                                                bat_w_req.push(WriteRequest::builder().put_request(req).build());
+                                            }
+                                        }
+                                        retry_items+=1;
+                                   
+                                        // persist write requests only when dynamodb batch limit reached (25 writerequests). 
+                                        if bat_w_req.len() == DYNAMO_BAT_SIZE {
+                                            bat_w_req = persist_dynamo_batch(&client_2, bat_w_req, table_name).await;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if bat_w_req.len() > 0 {
+                                bat_w_req = persist_dynamo_batch(&client_2, bat_w_req, table_name).await;
+                            }
+                            retry_items
+
+    });
+                        
+     let _ = scan_task.await;
+    let result = load_task.await;
+    if let Err(err) = result {
+        panic!("Error in load task of retry: {}",err);
+    }
+    retry_items=result.unwrap();
+    println!("retry items transferred {}",retry_items);
+        
+    if retry_items > 0 {
+            println!("retry items transferred {} Duration: {:?}",retry_items,Instant::now().duration_since(start));
+    } else {
+            println!("retry items transferred {}",retry_items);
+    }
+    println!("retry service...shutdown.");
+
+}
+
+
+async fn persist_dynamo_batch(
+    dynamo_client: &Client,
+    bat_w_req: Vec<WriteRequest>,
+    table_name : impl Into<String>,
+) -> Vec<WriteRequest> {
+ 
+    //println!("persist:{} ",bat_w_req.len());
+    let bat_w_outp = dynamo_client
+        .batch_write_item()
+        .request_items(table_name, bat_w_req)
+        .send()
+        .await;
+
+    match bat_w_outp {
+        Err(err) => {
+            let e = err.into_source().unwrap();
+            println!("{}",e);
+            process::exit(-1);
+            //panic!("Error in Dynamodb batch write in persist_dynamo_batch() - {}", err.source().unwrap());
+
+        }
+        Ok(resp) => {
+                
+            //println!("persist_dynamo_batch: written to table.");
+
+            if resp.unprocessed_items.as_ref().unwrap().values().len() > 0 {
+                println!("**** persist_dynamo_batch: unprocessed items {}",resp.unprocessed_items.unwrap().len());
+            }
+        }
+    }
+    let new_bat_w_req: Vec<WriteRequest> = vec![];
+
+    new_bat_w_req
+}
+
+
