@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process;
 
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep};
 
 use core::time::Duration;
 
@@ -24,8 +24,7 @@ async fn main() {
     // create a dynamodb client
     let config = aws_config::from_env().region("us-east-1").load().await;
     let dynamo_client = Client::new(&config);
-    let client = dynamo_client.clone();
-    let client2 = &client;
+    let client_reader = dynamo_client.clone();
 
     let table_name = "RustGraph.dev.2";
     let table_name_retry = "RustGraph.dev.1"; //2.retry";
@@ -54,14 +53,14 @@ async fn main() {
         //.select() - default to ALL_ATTRIBUTES
         let result = if first_time {
             first_time = false;
-            client2
+            client_reader
                 .scan()
                 .table_name(table_name_retry)
                 .limit(1000)
                 .send()
                 .await
         } else {
-            client2
+            client_reader
                 .scan()
                 .table_name(table_name_retry)
                 .set_exclusive_start_key(lek)
@@ -76,14 +75,13 @@ async fn main() {
         let scan_output = result.unwrap();
 
         if scan_output.items != None {
-            let client = dynamo_client.clone();
 
             // equiv to: go persist_task(..)
             // not necessary to .await on spawn as persist_task will send end message on a channel
             // which main will wait to receive. This emulates the await on a task handle.
             tokio::spawn(persist_task(
                 tasks_spawned,
-                client,
+                dynamo_client.clone(),
                 scan_output.items.unwrap(),
                 table_name,
                 task_ch.clone(),
@@ -195,13 +193,17 @@ async fn persist_batch(
             //panic!("Error in Dynamodb batch write in persist_batch() - {}", err.source().unwrap());
         }
         Ok(resp) => {
-            //println!("persist_batch: written to table.");
 
             if resp.unprocessed_items.as_ref().unwrap().len() > 0 {
-                println!(
-                    "**** persist_batch: unprocessed items {}",
-                    resp.unprocessed_items.unwrap().values().len()
-                );
+                // in the case of this single-table-design, unprocessed items will
+                // be associated with one table
+                for (_, v) in resp.unprocessed_items.unwrap() {
+
+                    sleep(Duration::from_millis(1000)).await;
+
+                    let new_bat_w_req: Vec<WriteRequest> = v;
+                    return new_bat_w_req;
+                }
             }
         }
     }
