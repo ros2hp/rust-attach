@@ -198,10 +198,10 @@ async fn persist_batch(
 
             if resp.unprocessed_items.as_ref().unwrap().len() > 0 {
                 // in the case of this single-table-design, unprocessed items will
-                // be associated with one table
+                // be associated with one table, hence return inside loop is safe
                 for (_, v) in resp.unprocessed_items.unwrap() {
 
-                    sleep(Duration::from_millis(5000)).await;
+                    sleep(Duration::from_millis(1000)).await;
 
                     let new_bat_w_req: Vec<WriteRequest> = v;
                     return new_bat_w_req;
