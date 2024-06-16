@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process;
 
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 
 use core::time::Duration;
 
@@ -24,7 +24,8 @@ async fn main() {
     // create a dynamodb client
     let config = aws_config::from_env().region("us-east-1").load().await;
     let dynamo_client = Client::new(&config);
-    let client_reader = dynamo_client.clone();
+    let client = dynamo_client.clone();
+    let client_writer = &client;
 
     let table_name = "RustGraph.dev.2";
     let table_name_retry = "RustGraph.dev.1"; //2.retry";
@@ -53,14 +54,14 @@ async fn main() {
         //.select() - default to ALL_ATTRIBUTES
         let result = if first_time {
             first_time = false;
-            client_reader
+            client_writer
                 .scan()
                 .table_name(table_name_retry)
                 .limit(1000)
                 .send()
                 .await
         } else {
-            client_reader
+            client_writer
                 .scan()
                 .table_name(table_name_retry)
                 .set_exclusive_start_key(lek)
@@ -178,7 +179,7 @@ async fn persist_batch(
     bat_w_req: Vec<WriteRequest>,
     table_name: impl Into<String>,
 ) -> Vec<WriteRequest> {
-    //println!("persist:{} ",bat_w_req.len());
+    
     let bat_w_outp = dynamo_client
         .batch_write_item()
         .request_items(table_name, bat_w_req)
@@ -193,13 +194,14 @@ async fn persist_batch(
             //panic!("Error in Dynamodb batch write in persist_batch() - {}", err.source().unwrap());
         }
         Ok(resp) => {
+            //println!("persist_batch: written to table.");
 
             if resp.unprocessed_items.as_ref().unwrap().len() > 0 {
                 // in the case of this single-table-design, unprocessed items will
                 // be associated with one table
                 for (_, v) in resp.unprocessed_items.unwrap() {
 
-                    sleep(Duration::from_millis(1000)).await;
+                    sleep(Duration::from_millis(5000)).await;
 
                     let new_bat_w_req: Vec<WriteRequest> = v;
                     return new_bat_w_req;
