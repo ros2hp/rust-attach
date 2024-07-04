@@ -174,8 +174,7 @@ async fn main()  -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static
             // })
             // .await;
  
-            // following does not work. seems to overwrite puid entry giving single edge rahter than multiple
-            // this map version requires no clone() of sortk as no closures are used that implement move semantics.
+            // this version requires no allocation (cloning) of sortk
             match parent_edges.get_mut(&puid) {
                 None => {
                     let mut e = HashMap::new();
