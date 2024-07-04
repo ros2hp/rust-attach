@@ -10,6 +10,7 @@ aws-sdk-dynamodb = { version = "1.10.0", features = ["behavior-version-latest"] 
 aws-types = "1.1.4"
 # tokio is a aws dependency
 tokio = { version = "1.38", features = ["full"] }
+mysql_async = "0.34.*"
 
 [dependencies.uuid]
 version = "1.8.0"
