@@ -39,6 +39,10 @@ const  LBL : u8 = 4;
 const  _LDT : u8 = 5;
 
 
+    // ==============================================================================
+    // Overflow block properties - consider making part of a graph type specification
+    // ==============================================================================
+
  	// EMBEDDED_CHILD_NODES - number of cUIDs (and the assoicated propagated scalar data) stored in the paraent uid-pred attribute e.g. A#G#:S.
 	// All uid-preds can be identified by the following sortk: <partitionIdentifier>#G#:<uid-pred-short-name>
 	// for a parent with limited amount of scalar data the number of embedded child uids can be relatively large. For a parent
@@ -124,38 +128,24 @@ enum Operation {
     Propagate(PropagateScalar)
 }
 
-//struct NodeMap(HashMap<SortK, Operation >);
 
-// snm : short name
-
-struct NodeType(String);
-
-impl From<std::collections::HashMap<String, AttributeValue>> for NodeType {
-     
-     fn from(mut value: HashMap<String, AttributeValue>) -> Self {
-       
-        let (k,v) = value.drain().next().unwrap();
-        return match k.as_str() {
-                "Ty" => NodeType(types::as_string2(v).unwrap()),
-                _ => panic!("expected Ty attribute"),
-            }
-    }
-}
 
 
 #[::tokio::main]
 async fn main()  -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>> {
 
     let _start_1 = Instant::now();  
-    // create a dynamodb client
+    // ==============================================================================
+    // Create a Dynamodb Client
+    // ==============================================================================
     let config = aws_config::from_env().region("us-east-1").load().await;
     let dynamo_client = DynamoClient::new(&config);
     let graph = "Movies".to_string();
-
-
+    // ==============================================================================
+    // Fetch Graph Types from MySQ based on graph name
+    // ==============================================================================
     let (node_types, graph_prefix_wdot) = types::fetch_graph_types(&dynamo_client, graph).await?; 
 
-    
     println!("Node Types:");
     // let nodetypes = type_caches.node_types.clone();
     //for t in ty_r.0.iter() {
@@ -165,42 +155,39 @@ async fn main()  -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static
             println!("attr.name [{}] dt [{}]  c [{}]",attr.name,attr.dt, attr.c);
         }
     }
-    
-    let _start_2 = Instant::now();
-    // create a mysql client
+    // ==============================================================================
+    // Setup a MySQL connection pool
+    // ==============================================================================
     let pool_opts = mysql_async::PoolOpts::new()
         .with_constraints(mysql_async::PoolConstraints::new(5, 30).unwrap())
         .with_inactive_connection_ttl(Duration::from_secs(60));
 
-    let host = "mysql8.cjegagpjwjyi.us-east-1.rds.amazonaws.com";
+    let host = "mysql8.???????.us-east-1.rds.amazonaws.com";
     let mysql_pool = mysql_async::Pool::new(
         mysql_async::OptsBuilder::default()
             //.from_url(url)
             .ip_or_hostname(host)
-            .user(Some("admin"))
-            .pass(Some("gjIe8Hl9SFD1g3ahyu6F"))
-            .db_name(Some("GoGraph"))
+            .user(Some("????"))
+            .pass(Some("??????"))
+            .db_name(Some("??????"))
             .pool_opts(pool_opts),
     );
     let pool = mysql_pool.clone();
     let mut conn = pool.get_conn().await.unwrap();
     
     // =================================================================================
-    // contents of next MySQL query
-    let mut parent_node : Vec<Uuid> =  vec![];
+    // MySQL query: parent nodes order by number of child connections descending
     // =================================================================================
+    let mut parent_node : Vec<Uuid> =  vec![];
+
     let parent_edge = "SELECT Uid FROM Edge_test order by cnt desc"
         .with(())
         .map(&mut conn, |puid| parent_node.push(puid) )
         .await;
-
-    
-    //let mut edge : HashMap<SortK, Vec<Cuid>> = HashMap::new();
-    
     // =================================================================================
-    // contents of next MySQL query
+    // MySQL query: graph edges by child uuid and sort key value (edge)
+    // =================================================================================
     let mut parent_edges : HashMap<Puid, HashMap<SortK, Vec<Cuid>>> = HashMap::new();
-    // =================================================================================
     let child_edge = "Select puid,sortk,cuid from test_childedge order by puid,sortk"        
         .with(())
         .map(&mut conn, |(puid,sortk ,cuid) : (Uuid,String,Uuid)| {
@@ -1102,7 +1089,23 @@ async fn persist(
 }
 
 
+//struct NodeMap(HashMap<SortK, Operation >);
 
+// snm : short name
+
+// struct NodeType(String);
+
+// impl From<std::collections::HashMap<String, AttributeValue>> for NodeType {
+     
+//      fn from(mut value: HashMap<String, AttributeValue>) -> Self {
+       
+//         let (k,v) = value.drain().next().unwrap();
+//         return match k.as_str() {
+//                 "Ty" => NodeType(types::as_string2(v).unwrap()),
+//                 _ => panic!("expected Ty attribute"),
+//             }
+//     }
+// }
 // returns node type as String, moving ownership from AttributeValue - preventing further allocation.
 async fn fetch_node_type<'a, T: Into<String>>(
                             dyn_client : &DynamoClient,
@@ -1144,7 +1147,7 @@ async fn save_item(
                     println!("error in write_request builder: {}",err);
             }
         Ok(req) =>  {
-                    bat_w_req.push(WriteRequest::builder().put_request().build());
+                    bat_w_req.push(WriteRequest::builder().put_request(req).build());
             }
         } 
         bat_w_req = print_batch(bat_w_req);
@@ -1212,7 +1215,7 @@ fn print_batch(
     
         let WriteRequest{put_request: pr, ..} = r;
         println!(" ------------------------  ");
-        for (attr, attrval) in pr.unwrap().item { 
+        for (attr, attrval) in pr.unwrap().item { // HashMap<String, AttributeValue>,
             println!(" putRequest [{}]   {:?}", attr,attrval);
         }
     }
