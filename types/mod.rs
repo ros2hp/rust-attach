@@ -686,7 +686,8 @@ impl From<HashMap<String, AttributeValue>> for NodeType {
                 "SortK" => ty.short = as_string2(v).unwrap(),
                 "Name"  => ty.long = as_string2(v).unwrap(),
                 "Reference" => ty.reference = as_bool2(v).unwrap(),
-                _       => panic!("NodeType from impl: expected Sortk | Name, got [{}]",k),
+                "OvBs" => {},
+                _       => panic!("NodeType from impl: unexpected attribute got [{}]",k),
             }
         }
         ty
@@ -742,7 +743,7 @@ pub async fn fetch_graph_types(
 
 
     let table_name = "GoGraphSS";
-    
+    println!("Fetch Fetch Graph Short Name ....");
     // ================================================================    
     // Fetch Graph Short Name (used as prefix in some PK values)
     // ================================================================
@@ -769,10 +770,11 @@ pub async fn fetch_graph_types(
                                      } else {
                                         panic!("graph prefix query returned Option::None");
                                      };
-                            
+    println!("graph_prefix_wdot [{}]",graph_prefix_wdot)   ;                   
     // ==============================    
     // Fetch Node Types  
     // ============================== 
+    println!("Fetch Node Types  ....");
     let mut tys = String::new();
     tys.push('#');
     tys.push_str(&graph_prefix_wdot);

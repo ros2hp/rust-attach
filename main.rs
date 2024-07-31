@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::string::String;
+use std::env;
 //use std::sync::Arc;
 
 use aws_sdk_dynamodb::primitives::Blob;
@@ -136,14 +137,22 @@ async fn main()  -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static
 
     let _start_1 = Instant::now();  
     // ==============================================================================
-    // Create a Dynamodb Client
+    // Source environment variables
     // ==============================================================================
+    let mysql_host = env::var("MYSQL_HOST").expect("env variable `MYSQL_HOST` should be set in profile");
+    let mysql_user = env::var("MYSQL_USER").expect("env variable `MYSQL_USER` should be set in profile");
+    let mysql_pwd = env::var("MYSQL_PWD").expect("env variable `MYSQL_PWD` should be set in profile");
+    let mysql_dbname = env::var("MYSQL_DBNAME").expect("env variable `MYSQL_DBNAME` should be set in profile");
+
+    // =========================
+    // Create a Dynamodb Client
+    // =========================
     let config = aws_config::from_env().region("us-east-1").load().await;
     let dynamo_client = DynamoClient::new(&config);
     let graph = "Movies".to_string();
-    // ==============================================================================
-    // Fetch Graph Types from MySQ based on graph name
-    // ==============================================================================
+    // ================================
+    // Fetch Graph Types from Dynamodb 
+    // ================================
     let (node_types, graph_prefix_wdot) = types::fetch_graph_types(&dynamo_client, graph).await?; 
 
     println!("Node Types:");
@@ -162,14 +171,13 @@ async fn main()  -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static
         .with_constraints(mysql_async::PoolConstraints::new(5, 30).unwrap())
         .with_inactive_connection_ttl(Duration::from_secs(60));
 
-    let host = "mysql8.???????.us-east-1.rds.amazonaws.com";
-    let mysql_pool = mysql_async::Pool::new(
+   let mysql_pool = mysql_async::Pool::new(
         mysql_async::OptsBuilder::default()
             //.from_url(url)
-            .ip_or_hostname(host)
-            .user(Some("????"))
-            .pass(Some("??????"))
-            .db_name(Some("??????"))
+            .ip_or_hostname(mysql_host)
+            .user(Some(mysql_user))
+            .pass(Some(mysql_pwd))
+            .db_name(Some(mysql_dbname))
             .pool_opts(pool_opts),
     );
     let pool = mysql_pool.clone();
@@ -183,7 +191,7 @@ async fn main()  -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static
     let parent_edge = "SELECT Uid FROM Edge_test order by cnt desc"
         .with(())
         .map(&mut conn, |puid| parent_node.push(puid) )
-        .await;
+        .await?;
     // =================================================================================
     // MySQL query: graph edges by child uuid and sort key value (edge)
     // =================================================================================
@@ -214,10 +222,10 @@ async fn main()  -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static
                 }
             }
         })
-        .await;
+        .await?;
         
     //TODO: check child_edge error??
-
+    panic!("Stop here....");
     // let ovb_hdrs : Vec<ovb_hdr> = vec![];
     // let ovbs : Vec<OvBatch> = vec![];
     let mut tasks : usize = 0;
@@ -1089,23 +1097,22 @@ async fn persist(
 }
 
 
-//struct NodeMap(HashMap<SortK, Operation >);
+struct NodeType(String);
 
-// snm : short name
-
-// struct NodeType(String);
-
-// impl From<std::collections::HashMap<String, AttributeValue>> for NodeType {
+impl From<std::collections::HashMap<String, AttributeValue>> for NodeType {
      
-//      fn from(mut value: HashMap<String, AttributeValue>) -> Self {
+     fn from(mut value: HashMap<String, AttributeValue>) -> Self {
        
-//         let (k,v) = value.drain().next().unwrap();
-//         return match k.as_str() {
-//                 "Ty" => NodeType(types::as_string2(v).unwrap()),
-//                 _ => panic!("expected Ty attribute"),
-//             }
-//     }
-// }
+        let (k,v) = value.drain().next().unwrap();
+        return match k.as_str() {
+                "Ty" => NodeType(types::as_string2(v).unwrap()),
+                _ => panic!("expected Ty attribute"),
+            }
+    }
+}
+
+
+
 // returns node type as String, moving ownership from AttributeValue - preventing further allocation.
 async fn fetch_node_type<'a, T: Into<String>>(
                             dyn_client : &DynamoClient,
@@ -1113,7 +1120,7 @@ async fn fetch_node_type<'a, T: Into<String>>(
                             graph_sn: T,
                             node_types: &'a types::NodeTypes
 ) -> &'a types::NodeType {
-    
+
     let mut sk_for_type : String = graph_sn.into();
     sk_for_type.push_str("|T#"); 
     
@@ -1135,6 +1142,7 @@ async fn fetch_node_type<'a, T: Into<String>>(
     };
     node_types.get(&nd.0)
 } 
+
 
 async fn save_item(
     dyn_client: &DynamoClient,
@@ -1161,6 +1169,7 @@ async fn save_item(
         // }
         bat_w_req
 }
+
 
 async fn persist_dynamo_batch(
     dyn_client: &DynamoClient,
