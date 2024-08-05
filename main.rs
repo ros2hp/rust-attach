@@ -238,10 +238,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     // 9. spawn task to attach node edges and propagate scalar values
     // ==============================================================
     for puid in parent_node {
+
+        // ---- remove following code ---------------
         i += 1;
         if i == 250 {
             panic!("exit now...");
         }
+        // ------------------------------------------
         let sk_edges = match parent_edges.remove(&puid) {
             None => {
                 panic!("logic error. No entry found in parent_edges");
