@@ -1,6 +1,10 @@
-//#[deny(unused_imports)]
+ //#[deny(unused_imports)]
 //#[warn(unused_imports)]
 #[allow(unused_imports)]
+
+mod service;
+mod types;
+
 use std::collections::HashMap;
 use std::env;
 use std::string::String;
@@ -19,17 +23,18 @@ use uuid::Uuid;
 use mysql_async::prelude::*;
 
 use tokio::time::{sleep, Duration, Instant};
+use tokio::sync::broadcast;
 //use tokio::task::spawn;
 
-mod types;
+
 
 const CHILD_UID: u8 = 1;
 const _UID_DETACHED: u8 = 3; // soft delete. Child detached from parent.
 const OV_BLOCK_UID: u8 = 4; // this entry represents an overflow block. Current batch id contained in Id.
 const OV_BATCH_MAX_SIZE: u8 = 5; // overflow batch reached max entries - stop using. Will force creating of new overflow block or a new batch.
 const _EDGE_FILTERED: u8 = 6; // set to true when edge fails GQL uid-pred  filter
-const _DYNAMO_BATCH_SIZE: usize = 25;
-const MAX_TASKS: usize = 1;
+const DYNAMO_BATCH_SIZE: usize = 25;
+const MAX_TASKS: usize = 6;
 
 const LS: u8 = 1;
 const LN: u8 = 2;
@@ -139,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         env::var("MYSQL_DBNAME").expect("env variable `MYSQL_DBNAME` should be set in profile");
     let graph =
         env::var("GRAPH_NAME").expect("env variable `GRAPH_NAME` should be set in profile");
-
+    let table_name = "RustGraph.dev.3";
     // ===========================
     // 2. Create a Dynamodb Client
     // ===========================
@@ -162,6 +167,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
             println!("attr.name [{}] dt [{}]  c [{}]", attr.name, attr.dt, attr.c);
         }
     }
+    
+    // create broadcast channel to shutdown services
+    let (shutdown_broadcast_ch, mut shutdown_recv_ch) = broadcast::channel(1); // broadcast::channel::<u8>(1);
+
+    // start Retry service (handles failed putitems)
+    println!("start Retry service...");
+    let (retry_ch, mut retry_rx) = tokio::sync::mpsc::channel(MAX_TASKS * 2);
+    let mut retry_shutdown_ch = shutdown_broadcast_ch.subscribe();
+    let retry_service = service::retry::start_service(
+        dynamo_client.clone(),
+        retry_rx,
+        retry_ch.clone(),
+        retry_shutdown_ch,
+        table_name,
+    );
+    
     // ================================
     // 4. Setup a MySQL connection pool
     // ================================
@@ -232,20 +253,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     // ====================================
     let (retry_send_ch, mut retry_rx) =
         tokio::sync::mpsc::channel::<Vec<aws_sdk_dynamodb::types::WriteRequest>>(MAX_TASKS);
-    let mut i = 0;
     
     // ==============================================================
     // 9. spawn task to attach node edges and propagate scalar values
     // ==============================================================
     for puid in parent_node {
-
-        // ---- remove following code ---------------
-        i += 1;
-        if i == 250 {
-            panic!("exit now...");
-        }
         // ------------------------------------------
-        let sk_edges = match parent_edges.remove(&puid) {
+        let mut p_sk_edges = match parent_edges.remove(&puid) {
             None => {
                 panic!("logic error. No entry found in parent_edges");
             }
@@ -260,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         let graph_sn = graph_prefix_wdot.trim_end_matches('.').to_string();
         let node_types = node_types.clone();        // Arc instance - single cache in heap storage
        
-        tasks += 1;                                 // concurrent task counter
+        tasks += 1;     // concurrent task counter
         // =========================================
         // 9.2 spawn tokio task for each parent node
         // =========================================
@@ -269,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
             // =====================================================================
             // p_node_ty : find type of puid . use sk "m|T#"  <graph>|<T,partition># //TODO : type short name should be in mysql table - saves fetching here.
             // =====================================================================
-            let p_node_ty = fetch_node_type(&dyn_client, &puid, &graph_sn, &node_types).await;
+            let p_node_ty = fetch_node_type(&dyn_client, &puid, &graph_sn, &node_types, table_name).await;
             // =========================================================================            
             // ty_attr :  attribute identifer prefixed with graph short name e.g. m|name
             // =========================================================================
@@ -279,20 +293,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
 
             
             let mut ovbs_ppg: Vec<AttributeValue> = vec![];             // Container for Overflow Block Uuids, also stores all propagated data.
-            let mut items: HashMap<SortK, Operation> = HashMap::new();  // split into Attach and Propagate Operations populated with associated enum values.
+            let mut items: HashMap<types::SortK, Operation> = HashMap::new();  // split into Attach and Propagate Operations populated with associated enum values.
             
             // ======================================================
             // 9.2.1 for each parent (p) node edge attach child nodes
             // ======================================================
-            for p_sk in sk_edges.keys() {
-            
+            p_sk_edges.drain().map(|(k, children) |(types::SortK::new(k), children)).for_each(|(p_sk,children)| {
+
                 // =====================================================================================
                 // 9.2.1.1 initilise items for current parent edge: (parent-edge-attribute) <- child node
                 // =====================================================================================
-                let v_edge = match items.get_mut(p_sk) {
-                
+                let v_edge = match items.get_mut(&p_sk) {
+                                   
                     None => {
-                        let edge_attr_sn = &p_sk[p_sk.rfind(':').unwrap() + 1..]; // A#G#:A -> "A"
+                        //let edge_attr_sn = &p_sk[p_sk.rfind(':').unwrap() + 1..]; // A#G#:A -> "A" get_attr
+                        let edge_attr_sn = p_sk.get_attr_sn(); // A#G#:A -> "A" get_attr
 
                         //let edge_attr_nm = ty_c.get_attr_nm(&node_ty_nm[..],edge_attr_sn);
                         let edge_attr_nm = p_node_ty.get_attr_nm(edge_attr_sn);
@@ -303,14 +318,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                         p_attr.push_str(edge_attr_nm);
                         p_attr.push('|');
                         p_attr.push_str(&p_node_ty.short_nm());
+
                         let pe = ParentEdge {
                             nd: vec![], //AttributeValue::B(Blob::new(cuid))],
                             xf: vec![], //AttributeValue::N(CHILD_UID.to_string())],
                             id: vec![],
                             //
-                            p: p_attr.to_owned(), // m|edge-attr-name|P
+                            p: p_attr, // m|edge-attr-name|P
                             cnt: 0,
-                            ty: ty_attr.to_owned(), // P or m|P
+                            ty: ty_attr.clone(), // P or m|P
                             rrobin_alloc: false,
                             eattr_nm: edge_attr_nm.to_string(),
                             eattr_sn: edge_attr_sn.to_string(),
@@ -320,8 +336,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                             //
                             rvse: vec![],
                         };
+                        // let Some(mut x) = items.insert(p_sk, Operation::Attach(pe)) else {panic!("failed insert")};
+                        // &mut x
                         items.insert(p_sk.clone(), Operation::Attach(pe));
-                        items.get_mut(p_sk).unwrap()
+                        items.get_mut(&p_sk).unwrap()
                     }
 
                     Some(v) => v,
@@ -336,9 +354,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                 // =====================================================
                 // 9.2.1.2 attach child nodes
                 // =====================================================
-                let Some(children) = sk_edges.get(p_sk) else {
-                    panic!("main: data error - no sk  [{}] found in sk_edgs", &p_sk)
-                };
                 for cuid in children {
                 
                     let cuid_p = cuid.clone();
@@ -358,7 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                         // create for attach only. Not necessary for propagation as this reverse entry will suffice to update parents.
                         if !child_ty.is_reference() {
                             let mut r_sk = "R#".to_string();
-                            r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                            r_sk.push_str(p_sk.from_partition());
                             let r = ReverseEdge {
                                 pk: AttributeValue::B(Blob::new(cuid.clone())),
                                 sk: AttributeValue::S(r_sk),
@@ -386,7 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                 // reverse edge - used to update xf in parent edge when child is deleted
                                 if !child_ty.is_reference() {
                                     let mut r_sk = "R#".to_string();
-                                    r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                                    r_sk.push_str(p_sk.from_partition());
                                     r_sk.push_str("%1");
                                     let r = ReverseEdge {
                                         pk: AttributeValue::B(Blob::new(cuid.clone())),
@@ -410,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                     // reverse edge
                                     if !child_ty.is_reference() {
                                         let mut r_sk = "R#".to_string();
-                                        r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                                        r_sk.push_str(p_sk.from_partition());
                                         r_sk.push_str("%");
                                         r_sk.push_str(&(cur_batch_idx + 1).to_string());
                                         let r = ReverseEdge {
@@ -442,7 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                         // reverse edge
                                         if !child_ty.is_reference() {
                                             let mut r_sk = "R#".to_string();
-                                            r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                                            r_sk.push_str(p_sk.from_partition());
                                             r_sk.push_str("%");
                                             r_sk.push_str(&(cur_batch_idx + 1).to_string());
                                             let r = ReverseEdge {
@@ -471,7 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                             // reverse edge
                                             if !child_ty.is_reference() {
                                                 let mut r_sk = "R#".to_string();
-                                                r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                                                r_sk.push_str(p_sk.from_partition());
                                                 r_sk.push_str("%");
                                                 r_sk.push_str(&(cur_batch_idx + 1).to_string());
                                                 let r = ReverseEdge {
@@ -502,7 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                             // reverse edge
                                             if !child_ty.is_reference() {
                                                 let mut r_sk = "R#".to_string();
-                                                r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                                                r_sk.push_str(p_sk.from_partition());
                                                 r_sk.push_str("%1");
                                                 let r = ReverseEdge {
                                                     pk: AttributeValue::B(Blob::new(cuid.clone())),
@@ -536,7 +551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                 // reverse edge
                                 if !child_ty.is_reference() {
                                     let mut r_sk = "R#".to_string();
-                                    r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                                    r_sk.push_str(p_sk.from_partition());
                                     r_sk.push_str("%");
                                     r_sk.push_str(&(cur_batch_idx + 1).to_string());
                                     let r = ReverseEdge {
@@ -559,7 +574,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                 // reverse edge
                                 if !child_ty.is_reference() {
                                     let mut r_sk = "R#".to_string();
-                                    r_sk.push_str(&p_sk[p_sk.find('#').unwrap() + 1..]);
+                                    r_sk.push_str(p_sk.from_partition());
                                     r_sk.push_str("%");
                                     r_sk.push_str(
                                         &(e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize]
@@ -576,211 +591,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                         }
                     }
                 }
-            }
-            
+            });
+
             // ============================================================
             // 9.2.2 persist attached nodes to each parent edge to database 
             // ============================================================
-            persist(
-                &dyn_client,
-                puid.clone(),
-                graph_sn.as_str(),
-                &retry_ch,
-                &task_ch,
-                &ovbs_ppg,
-                items,
-            )
-            .await;
-
-            // ============================================
-            // 9.2.3 propagate child scalar data to parent
-            // ============================================
-            let mut items: HashMap<SortK, Operation> = HashMap::new();
-            
-            for (sk_p, children) in sk_edges {                // consume sk_edges now that attach has been done
-
-                let edge_attr_sn = &sk_p[sk_p.rfind(':').unwrap() + 1..]; // A#G#:A -> "A"
-
-                let edge_attr_nm = p_node_ty.get_attr_nm(edge_attr_sn);
-
-                for cuid in children {
-                    let cuid_p = cuid.clone();
-                    let child_ty = node_types.get(p_node_ty.get_edge_child_ty(edge_attr_nm));
-                    let child_parts = child_ty.get_scalar_partitions();
-                    // =====================================================================
-                    // 9.2.3.1 for each child node's scalar partitions and scalar attributes
-                    // =====================================================================
-                    for (partition, attrs) in child_parts {
-                       
-                        let mut sk_query = graph_sn.clone();     // generate sortk's for query
-                        sk_query.push_str("|A#");
-                        sk_query.push_str(partition.as_str());
-
-                        if attrs.len() == 1 {
-                            sk_query.push_str("#:");
-                            sk_query.push_str(attrs[0]);
-                        }
-                        // ============================================================
-                        // 9.2.3.1.1 fetch scalar data by sortk partition in child node
-                        // ============================================================
-                        let result = dyn_client
-                            .query()
-                            .table_name("RustGraph.dev.2")
-                            .key_condition_expression("#p = :uid and begins_with(#s,:sk_v)")
-                            .expression_attribute_names("#p", types::PK)
-                            .expression_attribute_names("#s", types::SK)
-                            .expression_attribute_values(
-                                ":uid",
-                                AttributeValue::B(Blob::new(cuid_p.clone())),
-                            )
-                            .expression_attribute_values(":sk_v", AttributeValue::S(sk_query))
-                            .send()
-                            .await;
-
-                        if let Err(err) = result {
-                            panic!("error in query() {}", err);
-                        }
-
-                        // ============================================================
-                        // 9.2.3.1.2 populate node cach (nc) from query result
-                        // ============================================================
-                        let mut nc: Vec<types::DataItem> = vec![];
-                        let mut nc_attr_map: types::NodeMap = types::NodeMap(HashMap::new()); // HashMap<types::AttrShortNm, types::DataItem> = HashMap::new();
-
-                        if let Some(items) = result.unwrap().items {
-                            nc = items.into_iter().map(|v| v.into()).collect();
-                        }
-
-                        for c in nc {
-                            nc_attr_map.0.insert(c.sk.attribute_sn().to_owned(), c);
-                        }
-                        // ===============================================================================
-                        // 9.2.3.1.3 add scalar data for each attribute queried above to edge in items
-                        // ===============================================================================
-                        for attr_sn in attrs {
-                            // associated parent node sort key to attach child's scalar data
-                            // generate sk for propagated (ppg) data
-                            let mut ppg_sk = sk_p.clone();
-                            ppg_sk.push('#');
-                            ppg_sk.push_str(partition.as_str());
-                            ppg_sk.push_str("#:");
-                            ppg_sk.push_str(attr_sn);
-
-                            //let dt = ty_c.get_attr_dt(child_ty,attr_sn);
-                            let dt = child_ty.get_attr_dt(attr_sn);
-                            // check if ppg_sk in HashMap items
-                            let op_ppg = match items.get_mut(&ppg_sk[..]) {
-                                None => {
-                                    let op = Operation::Propagate(PropagateScalar {
-                                        entry: None,
-                                        sk: ppg_sk.clone(),
-                                        ls: vec![],
-                                        ln: vec![],
-                                        lbl: vec![],
-                                        lb: vec![],
-                                        ldt: vec![],
-                                    });
-                                    items.insert(ppg_sk.clone(), op);
-                                    items.get_mut(&ppg_sk[..]).unwrap()
-                                }
-                                Some(es) => es,
-                            };
-
-                            let e_p = match op_ppg {
-                                Operation::Propagate(ref mut e_) => e_,
-                                _ => {
-                                    panic!("Expected Operation::Propagate")
-                                }
-                            };
-
-                            let Some(di) = nc_attr_map.0.remove(attr_sn) else {
-                                panic!("not found in nc_attr_map [{}]", ppg_sk)
-                            };
-
-                            match dt {
-                                "S" => {
-                                    match di.s {
-                                        None => {
-                                            if !child_ty.is_atttr_nullable(attr_sn) {
-                                                panic!("Data Error: Attribute {} in type {} is not null but null returned from db",attr_sn,child_ty.long_nm())
-                                            }
-                                            e_p.ls.push(AttributeValue::Null(true));
-                                        }
-                                        Some(v) => e_p.ls.push(AttributeValue::S(v)),
-                                    }
-                                    e_p.entry = Some(LS);
-                                }
-
-                                "I" | "F" => {
-                                    match di.n {
-                                        // no conversion into int or float. Keep as String for propagation purposes.
-                                        None => {
-                                            if !child_ty.is_atttr_nullable(attr_sn) {
-                                                panic!("Data Error: Attribute {} in type {} is not null but null returned from db",attr_sn,child_ty.long_nm())
-                                            }
-                                            e_p.ln.push(AttributeValue::Null(true));
-                                        }
-                                        Some(v) => e_p.ln.push(AttributeValue::N(v)),
-                                    }
-                                    e_p.entry = Some(LN);
-                                }
-
-                                "B" => {
-                                    match di.b {
-                                        None => {
-                                            if !child_ty.is_atttr_nullable(attr_sn) {
-                                                panic!("Data Error: Attribute {} in type {} is not null but null returned from db",attr_sn,child_ty.long_nm())
-                                            }
-                                            e_p.lb.push(AttributeValue::Null(true));
-                                        }
-                                        Some(v) => e_p.lb.push(AttributeValue::B(Blob::new(v))),
-                                    }
-                                    e_p.entry = Some(LB);
-                                }
-                                //"DT" => e_p.ldt.push(AttributeValue::S(di.dt)),
-                                "Bl" => {
-                                    match di.bl {
-                                        None => {
-                                            if !child_ty.is_atttr_nullable(attr_sn) {
-                                                panic!("Data Error: Attribute {} in type {} is not null but null returned from db",attr_sn,child_ty.long_nm())
-                                            }
-                                            e_p.lbl.push(AttributeValue::Null(true));
-                                        }
-                                        Some(v) => e_p.lbl.push(AttributeValue::Bool(v)),
-                                    }
-                                    e_p.entry = Some(LBL);
-                                }
-
-                                _ => {
-                                    panic!("expected Scalar Type, got [{}]", dt)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // ========================================================
-            // 9.2.3 persist parent node's propagated data to database 
-            // ========================================================
             persist(
                 &dyn_client,
                 puid,
                 graph_sn.as_str(),
                 &retry_ch,
                 &task_ch,
-                &ovbs_ppg,
+                ovbs_ppg,
                 items,
+                table_name,
             )
             .await;
-            
+
             // ====================================
             // 9.2.4 send complete message to main
             // ====================================
             if let Err(e) = task_ch.send(true).await {
                 panic!("error sending on channel task_ch - {}", e);
             }
+
         });
+
 
         // =============================================================
         // 9.3 Wait for task to complete if max concurrent tasks reached
@@ -790,7 +626,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
             task_rx.recv().await;
             tasks -= 1;
         }
+        //break;
     }
+    
+    // =========================================
+    // 10.0 Wait for remaining tasks to complete 
+    // =========================================
+    while tasks > 0 {
+        // wait for a task to finish...
+        task_rx.recv().await;
+        tasks -= 1;
+    }   
+    
+    println!("Waiting for support services to finish...");
+    shutdown_broadcast_ch.send(0);
+    retry_service.await;
+    
     Ok(())
 }
 
@@ -800,8 +651,9 @@ async fn persist(
     graph_sn: &str,
     retry_ch: &tokio::sync::mpsc::Sender<Vec<aws_sdk_dynamodb::types::WriteRequest>>,
     task_ch: &tokio::sync::mpsc::Sender<bool>,
-    ovbs_ppg: &Vec<AttributeValue>,
-    items: HashMap<SortK, Operation>,
+    ovbs_ppg: Vec<AttributeValue>,
+    items: HashMap<types::SortK, Operation>,
+    table_name: &str,
 ) {
     // persist to database
     let mut bat_w_req: Vec<WriteRequest> = vec![];
@@ -820,7 +672,7 @@ async fn persist(
                 let put = aws_sdk_dynamodb::types::PutRequest::builder();
                 let put = put
                     .item(types::PK, AttributeValue::B(Blob::new(puid.clone())))
-                    .item(types::SK, AttributeValue::S(sk.clone()))
+                    .item(types::SK, AttributeValue::S(sk.string()))
                     .item(types::ND, AttributeValue::L(e.nd))
                     .item(types::XF, AttributeValue::L(e.xf))
                     .item(types::BID, AttributeValue::L(id_av))
@@ -828,7 +680,7 @@ async fn persist(
                     .item(types::P, AttributeValue::S(e.p))
                     .item(types::CNT, AttributeValue::N(e.cnt.to_string()));
 
-                bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put).await;
+                bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put, table_name).await;
 
                 // reverse edge items - only for non-reference type
                 for r in e.rvse {
@@ -838,7 +690,7 @@ async fn persist(
                         .item(types::SK, r.sk)
                         .item(types::TUID, r.tuid);
 
-                    bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put).await;
+                    bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put, table_name).await;
                 }
 
                 for ovb in e.ovbs {
@@ -855,10 +707,10 @@ async fn persist(
                                 .item(types::PARENT, AttributeValue::B(Blob::new(puid.clone())))
                                 .item(types::GRAPH, AttributeValue::S(graph_sn.to_owned())); //TODO add graph name
 
-                            bat_w_req = save_item(&dyn_client, bat_w_req, &retry_ch, put).await;
+                            bat_w_req = save_item(&dyn_client, bat_w_req, &retry_ch, put, table_name).await;
                         }
 
-                        let mut ovsk = String::from(sk.clone());
+                        let mut ovsk = String::from(sk.string());
                         ovsk.push('%');
                         ovsk.push_str(&batch.to_string());
 
@@ -869,247 +721,26 @@ async fn persist(
                             .item(types::ND, AttributeValue::L(ovbat.nd))
                             .item(types::XF, AttributeValue::L(ovbat.xf));
 
-                        bat_w_req = save_item(&dyn_client, bat_w_req, &retry_ch, put).await;
+                        bat_w_req = save_item(&dyn_client, bat_w_req, &retry_ch, put,table_name).await;
 
                         batch += 1;
                     }
                 }
-            }
-
-            Operation::Propagate(mut e) => {
-                println!("Persist Operation::Propagate");
-
-                let mut finished = false;
-
-                let put = aws_sdk_dynamodb::types::PutRequest::builder();
-                let mut put = put
-                    .item(types::PK, AttributeValue::B(Blob::new(puid.clone())))
-                    .item(types::SK, AttributeValue::S(sk.clone()));
-
-                match e.entry.unwrap() {
-                    LS => {
-                        if e.ls.len() <= EMBEDDED_CHILD_NODES {
-                            let embedded: Vec<_> = e.ls.drain(..e.ls.len()).collect();
-                            put = put.item(types::LS, AttributeValue::L(embedded));
-                            finished = true;
-                        } else {
-                            let embedded: Vec<_> = e.ls.drain(..EMBEDDED_CHILD_NODES).collect();
-                            put = put.item(types::LS, AttributeValue::L(embedded));
-                        }
-                    }
-                    LN => {
-                        if e.ln.len() <= EMBEDDED_CHILD_NODES {
-                            let embedded: Vec<_> = e.ln.drain(..e.ln.len()).collect();
-                            put = put.item(types::LS, AttributeValue::L(embedded));
-                            finished = true;
-                        } else {
-                            let embedded: Vec<_> = e.ln.drain(..EMBEDDED_CHILD_NODES).collect();
-                            put = put.item(types::LN, AttributeValue::L(embedded));
-                        }
-                    }
-                    LBL => {
-                        if e.lbl.len() <= EMBEDDED_CHILD_NODES {
-                            let embedded: Vec<_> = e.lbl.drain(..e.lbl.len()).collect();
-                            put = put.item(types::LS, AttributeValue::L(embedded));
-                            finished = true;
-                        } else {
-                            let embedded: Vec<_> = e.lbl.drain(..EMBEDDED_CHILD_NODES).collect();
-                            put = put.item(types::LBL, AttributeValue::L(embedded));
-                        }
-                    }
-                    LB => {
-                        if e.lb.len() <= EMBEDDED_CHILD_NODES {
-                            let embedded: Vec<_> = e.lb.drain(..e.lb.len()).collect();
-                            put = put.item(types::LS, AttributeValue::L(embedded));
-                            finished = true;
-                        } else {
-                            let embedded: Vec<_> = e.lb.drain(..EMBEDDED_CHILD_NODES).collect();
-                            put = put.item(types::LB, AttributeValue::L(embedded));
-                        }
-                    }
-                    _ => {
-                        panic!("unexpected entry match in Operation::Propagate")
-                    }
-                };
-
-                bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put).await;
-
-                if finished {
-                    continue;
-                }
-
-                let mut bid = 0;
-
-                // =====================================
-                // distribute progated data across ovbs
-                // =====================================
-                for ovb in ovbs_ppg {
-                    for _bat in 0..OV_BATCH_THRESHOLD {
-                        bid += 1;
-
-                        let mut sk_w_bid = sk.clone();
-                        sk_w_bid.push('%');
-                        sk_w_bid.push_str(&bid.to_string());
-
-                        let put = aws_sdk_dynamodb::types::PutRequest::builder();
-                        let mut put = put
-                            .item(types::PK, ovb.clone())
-                            .item(types::SK, AttributeValue::S(sk_w_bid)); //TODO: add batch id
-
-                        match e.entry.unwrap() {
-                            LS => {
-                                if e.ls.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.ls.drain(..e.ls.len()).collect();
-                                    put = put.item(types::LS, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.ls.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LS, AttributeValue::L(batch));
-                                }
-                            }
-
-                            LN => {
-                                if e.ln.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.ln.drain(..e.ln.len()).collect();
-                                    put = put.item(types::LN, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.ln.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LN, AttributeValue::L(batch));
-                                }
-                            }
-
-                            LBL => {
-                                if e.lbl.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.lbl.drain(..e.lbl.len()).collect();
-                                    put = put.item(types::LBL, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.lbl.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LBL, AttributeValue::L(batch));
-                                }
-                            }
-
-                            LB => {
-                                if e.lb.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.lb.drain(..e.lb.len()).collect();
-                                    put = put.item(types::LB, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.lb.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LB, AttributeValue::L(batch));
-                                }
-                            }
-                            _ => {
-                                panic!("unexpected entry match in Operation::Propagate")
-                            }
-                        }
-
-                        bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put).await;
-
-                        if finished {
-                            break;
-                        }
-                    }
-
-                    if finished {
-                        break;
-                    }
-                }
-
-                if finished {
-                    continue;
-                }
-
-                while !finished {
-                    for ovb in ovbs_ppg {
-                        bid += 1;
-
-                        let mut sk_w_bid = sk.clone();
-                        sk_w_bid.push('%');
-                        sk_w_bid.push_str(&bid.to_string());
-
-                        let put = aws_sdk_dynamodb::types::PutRequest::builder();
-                        let mut put = put
-                            .item(types::PK, ovb.clone())
-                            .item(types::SK, AttributeValue::S(sk_w_bid));
-
-                        match e.entry.unwrap() {
-                            LS => {
-                                if e.ls.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.ls.drain(..e.ls.len()).collect();
-                                    put = put.item(types::LS, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.ls.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LS, AttributeValue::L(batch));
-                                }
-                            }
-
-                            LN => {
-                                if e.ln.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.ln.drain(..e.ln.len()).collect();
-                                    put = put.item(types::LN, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.ln.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LN, AttributeValue::L(batch));
-                                }
-                            }
-
-                            LBL => {
-                                if e.lbl.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.ln.drain(..e.lbl.len()).collect();
-                                    put = put.item(types::LBL, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.ln.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LBL, AttributeValue::L(batch));
-                                }
-                            }
-
-                            LB => {
-                                if e.lb.len() <= OV_MAX_BATCH_SIZE {
-                                    let batch: Vec<_> = e.lb.drain(..e.lb.len()).collect();
-                                    put = put.item(types::LB, AttributeValue::L(batch));
-                                    finished = true;
-                                } else {
-                                    let batch: Vec<_> = e.lb.drain(..OV_MAX_BATCH_SIZE).collect();
-                                    put = put.item(types::LB, AttributeValue::L(batch));
-                                }
-                            }
-                            _ => {
-                                panic!("unexpected entry match in Operation::Propagate")
-                            }
-                        }
-
-                        bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put).await;
-
-                        if finished {
-                            break;
-                        }
-                    }
-                }
-            }
+            },
+            Operation::Propagate(_) => {},
         } // end match
 
-        if let Err(e) = task_ch.send(true).await {
-            panic!("error sending on channel task_ch - {}", e);
-        }
     } // end for
-}
-
-struct NodeType(String);
-
-impl From<std::collections::HashMap<String, AttributeValue>> for NodeType {
-    fn from(mut value: HashMap<String, AttributeValue>) -> Self {
-        let (k, v) = value.drain().next().unwrap();
-        return match k.as_str() {
-            "Ty" => NodeType(types::as_string2(v).unwrap()),
-            _ => panic!("expected Ty attribute"),
-        };
+    
+    //println!("About to exit persis()...remaining batch to persist {}",bat_w_req.len());
+    if bat_w_req.len() > 0  {
+        // =================================================================================
+        // persist to Dynamodb
+        persist_dynamo_batch(dyn_client, bat_w_req, retry_ch, table_name).await;
+        // =================================================================================
     }
 }
+
 
 // returns node type as String, moving ownership from AttributeValue - preventing further allocation.
 async fn fetch_node_type<'a, T: Into<String>>(
@@ -1117,15 +748,16 @@ async fn fetch_node_type<'a, T: Into<String>>(
     uid: &Uuid,
     graph_sn: T,
     node_types: &'a types::NodeTypes,
+    table_name : &str,
 ) -> &'a types::NodeType {
     let mut sk_for_type: String = graph_sn.into();
     sk_for_type.push_str("|T#");
 
     let result = dyn_client
         .get_item()
-        .table_name("RustGraph.dev.2")
+        .table_name(table_name)
         .key(types::PK, AttributeValue::B(Blob::new(uid.clone())))
-        .key(types::SK, AttributeValue::S(sk_for_type))
+        .key(types::SK, AttributeValue::S(sk_for_type.clone()))
         .projection_expression("Ty")
         .send()
         .await;
@@ -1136,11 +768,11 @@ async fn fetch_node_type<'a, T: Into<String>>(
             err
         )
     }
-    let nd: NodeType = match result.unwrap().item {
-        None => panic!("No type item found in fetch_node_type() for [{}]", uid),
+    let nd: types::NodeType = match result.unwrap().item {
+        None => panic!("No type item found in fetch_node_type() for [{}] [{}]", uid, sk_for_type),
         Some(v) => v.into(),
     };
-    node_types.get(&nd.0)
+    node_types.get(&nd.short_nm())
 }
 
 async fn save_item(
@@ -1148,6 +780,7 @@ async fn save_item(
     mut bat_w_req: Vec<WriteRequest>,
     retry_ch: &tokio::sync::mpsc::Sender<Vec<aws_sdk_dynamodb::types::WriteRequest>>,
     put: PutRequestBuilder,
+    table_name: &str,
 ) -> Vec<WriteRequest> {
     match put.build() {
         Err(err) => {
@@ -1157,15 +790,15 @@ async fn save_item(
             bat_w_req.push(WriteRequest::builder().put_request(req).build());
         }
     }
-    bat_w_req = print_batch(bat_w_req);
+    //bat_w_req = print_batch(bat_w_req);
 
-    // if bat_w_req.len() == DYNAMO_BATCH_SIZE {
-    //     // =================================================================================
-    //     // persist to Dynamodb
-    //        bat_w_req = persist_dynamo_batch(dyn_client, bat_w_req, retry_ch);.await;
-    //     // =================================================================================
-    //     bat_w_req = print_batch(bat_w_req);
-    // }
+    if bat_w_req.len() == DYNAMO_BATCH_SIZE {
+        // =================================================================================
+        // persist to Dynamodb
+        bat_w_req = persist_dynamo_batch(dyn_client, bat_w_req, retry_ch, table_name).await;
+        // =================================================================================
+       // bat_w_req = print_batch(bat_w_req);
+    }
     bat_w_req
 }
 
@@ -1173,10 +806,11 @@ async fn persist_dynamo_batch(
     dyn_client: &DynamoClient,
     bat_w_req: Vec<WriteRequest>,
     retry_ch: &tokio::sync::mpsc::Sender<Vec<aws_sdk_dynamodb::types::WriteRequest>>,
+    table_name: &str,
 ) -> Vec<WriteRequest> {
     let bat_w_outp = dyn_client
         .batch_write_item()
-        .request_items("RustGraph.dev.2", bat_w_req)
+        .request_items(table_name, bat_w_req)
         .send()
         .await;
 
@@ -1193,11 +827,11 @@ async fn persist_dynamo_batch(
                 for (_, v) in resp.unprocessed_items.unwrap() {
                     println!("persist_dynamo_batch, unprocessed items..delay 2secs");
                     sleep(Duration::from_millis(2000)).await;
-                    //let resp = retry_ch.send(v).await;                // retry_ch auto deref'd to access method send.
+                    let resp = retry_ch.send(v).await;                // retry_ch auto deref'd to access method send.
 
-                    // if let Err(err) = resp {
-                    //     panic!("Error sending on retry channel : {}", err);
-                    // }
+                    if let Err(err) = resp {
+                        panic!("Error sending on retry channel : {}", err);
+                    }
                 }
 
                 // TODO: aggregate batchwrite metrics in bat_w_output.
