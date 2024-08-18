@@ -306,10 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                 let v_edge = match items.get_mut(&p_sk) {
                                    
                     None => {
-                        //let edge_attr_sn = &p_sk[p_sk.rfind(':').unwrap() + 1..]; // A#G#:A -> "A" get_attr
                         let edge_attr_sn = p_sk.get_attr_sn(); // A#G#:A -> "A" get_attr
-
-                        //let edge_attr_nm = ty_c.get_attr_nm(&node_ty_nm[..],edge_attr_sn);
                         let edge_attr_nm = p_node_ty.get_attr_nm(edge_attr_sn);
 
                         // RustGraph Data model, P attribute e.g "m|Film.Director|P" - used as partition key in global indexes P_S, P_N, P_B
@@ -368,19 +365,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                         e.nd.push(AttributeValue::B(Blob::new(cuid.clone())));
                         e.xf.push(AttributeValue::N(CHILD_UID.to_string()));
                         e.id.push(0);
-
-                        // reverse edge - only for non-reference nodes - used to update xf in parent edge when child is deleted
-                        // create for attach only. Not necessary for propagation as this reverse entry will suffice to update parents.
-                        if !child_ty.is_reference() {
-                            let mut r_sk = "R#".to_string();
-                            r_sk.push_str(p_sk.from_partition());
-                            let r = ReverseEdge {
-                                pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                sk: AttributeValue::S(r_sk),
-                                tuid: AttributeValue::B(Blob::new(puid.clone())),
-                            };
-                            e.rvse.push(r);
-                        }
+                        // reverse edge - only for non-reference nodes  and where no reverse edge exists in child type
+                        // e.g. parent has type attribute "director.film" & film type has attribute "film.director" then
+                        // no need to add a reverse edge as data model has reverse explicit edge defined and it will be in the data.
+                        // However if child type has no "film.director" attribute name then add reverse edge to child
+                        // When creating an reverse edge need to decide if is a 1:1 or 1:M.
+                        // if !child_ty.is_reference() && child_ty.has_no_explicit_reverse_edge(p_sk) {
+                        //     let mut r_sk = "R#".to_string();
+                        //     r_sk.push_str(p_sk.from_partition());
+                        //     let r = ReverseEdge {
+                        //         pk: AttributeValue::B(Blob::new(cuid.clone())),
+                        //         sk: AttributeValue::S(r_sk),
+                        //         tuid: AttributeValue::B(Blob::new(puid.clone())),
+                        //     };
+                        //     e.rvse.push(r);
+                        // }
                     } else {
                         if !e.rrobin_alloc {
                             if e.ovbs.len() == 0 {
@@ -399,17 +398,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                 e.ovb_idx = 0;
 
                                 // reverse edge - used to update xf in parent edge when child is deleted
-                                if !child_ty.is_reference() {
-                                    let mut r_sk = "R#".to_string();
-                                    r_sk.push_str(p_sk.from_partition());
-                                    r_sk.push_str("%1");
-                                    let r = ReverseEdge {
-                                        pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                        sk: AttributeValue::S(r_sk),
-                                        tuid: AttributeValue::B(Blob::new(ovb.clone())),
-                                    };
-                                    e.rvse.push(r);
-                                }
                             } else {
                                 // add data to current batch until max batch size reached. After max batch size reached create new batch
                                 // until max batch threshold reached in which case create new ovb
@@ -423,18 +411,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                     batch.xf.push(AttributeValue::N(CHILD_UID.to_string()));
 
                                     // reverse edge
-                                    if !child_ty.is_reference() {
-                                        let mut r_sk = "R#".to_string();
-                                        r_sk.push_str(p_sk.from_partition());
-                                        r_sk.push_str("%");
-                                        r_sk.push_str(&(cur_batch_idx + 1).to_string());
-                                        let r = ReverseEdge {
-                                            pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                            sk: AttributeValue::S(r_sk),
-                                            tuid: ovbs_ppg[e.ovb_idx].clone(),
-                                        };
-                                        e.rvse.push(r);
-                                    }
                                 } else {
                                     // max batch size reaced - creat new batch - check thresholds first though
                                     // as new batch may be added to ovb on rr basis.
@@ -455,18 +431,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                         });
                                         e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize] += 1;
                                         // reverse edge
-                                        if !child_ty.is_reference() {
-                                            let mut r_sk = "R#".to_string();
-                                            r_sk.push_str(p_sk.from_partition());
-                                            r_sk.push_str("%");
-                                            r_sk.push_str(&(cur_batch_idx + 1).to_string());
-                                            let r = ReverseEdge {
-                                                pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                                sk: AttributeValue::S(r_sk),
-                                                tuid: ovbs_ppg[e.ovb_idx].clone(),
-                                            };
-                                            e.rvse.push(r);
-                                        }
                                     } else {
                                         let cur_batch_idx = e.ovbs[e.ovb_idx].len() - 1;
                                         let ovbuid =
@@ -484,18 +448,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                             e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize] += 1;
 
                                             // reverse edge
-                                            if !child_ty.is_reference() {
-                                                let mut r_sk = "R#".to_string();
-                                                r_sk.push_str(p_sk.from_partition());
-                                                r_sk.push_str("%");
-                                                r_sk.push_str(&(cur_batch_idx + 1).to_string());
-                                                let r = ReverseEdge {
-                                                    pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                                    sk: AttributeValue::S(r_sk),
-                                                    tuid: ovbs_ppg[e.ovb_idx].clone(),
-                                                };
-                                                e.rvse.push(r);
-                                            }
                                         } else {
                                             // no more batches allowed in latest ovb. Create new ovb and add batch
                                             let ovbuid = Uuid::new_v4();
@@ -515,29 +467,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                             // move to next ovb when adding next batch
                                             e.ovb_idx += 1;
                                             // reverse edge
-                                            if !child_ty.is_reference() {
-                                                let mut r_sk = "R#".to_string();
-                                                r_sk.push_str(p_sk.from_partition());
-                                                r_sk.push_str("%1");
-                                                let r = ReverseEdge {
-                                                    pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                                    sk: AttributeValue::S(r_sk),
-                                                    tuid: ovbs_ppg[e.ovb_idx].clone(),
-                                                };
-                                                e.rvse.push(r);
-                                            }
                                         }
                                     }
                                 }
                             }
                         } else {
-                            // no more ovbs allowed. choose from existing ovbs, using round robin...
-                            e.ovb_idx += 1;
-                            if e.ovb_idx == MAX_OV_BLOCKS {
-                                e.ovb_idx = 0;
-                            }
+                            // no more ovbs allowed. keep using current ovb (ovb_idx) until current batch full
                             // add to last batch in this ovb.
-                            let cur_batch_idx = e.ovbs[e.ovb_idx].len() - 1; //e.ovbs[e.ovb_idx].id
+                            let cur_batch_idx = e.ovbs[e.ovb_idx].len() - 1; 
 
                             if e.ovbs[e.ovb_idx].get(cur_batch_idx).unwrap().nd.len()
                                 < OV_MAX_BATCH_SIZE
@@ -549,20 +486,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                 cur_batch.xf.push(AttributeValue::N(CHILD_UID.to_string()));
 
                                 // reverse edge
-                                if !child_ty.is_reference() {
-                                    let mut r_sk = "R#".to_string();
-                                    r_sk.push_str(p_sk.from_partition());
-                                    r_sk.push_str("%");
-                                    r_sk.push_str(&(cur_batch_idx + 1).to_string());
-                                    let r = ReverseEdge {
-                                        pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                        sk: AttributeValue::S(r_sk),
-                                        tuid: ovbs_ppg[e.ovb_idx].clone(),
-                                    };
-                                    e.rvse.push(r);
-                                }
                             } else {
-                                // all batches in ovb full, add new batch...
+                                // current batch in current ovb is full, go to next ovb (using round robin) and add new batch...
+                                e.ovb_idx += 1;
+                                if e.ovb_idx == MAX_OV_BLOCKS {
+                                    e.ovb_idx = 0;
+                                }
                                 let ovbuid = e.ovbs[e.ovb_idx].get(cur_batch_idx).unwrap().pk;
                                 e.ovbs[e.ovb_idx].push(OvBatch {
                                     pk: ovbuid,
@@ -572,21 +501,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                 e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize] += 1;
 
                                 // reverse edge
-                                if !child_ty.is_reference() {
-                                    let mut r_sk = "R#".to_string();
-                                    r_sk.push_str(p_sk.from_partition());
-                                    r_sk.push_str("%");
-                                    r_sk.push_str(
-                                        &(e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize]
-                                            .to_string()),
-                                    );
-                                    let r = ReverseEdge {
-                                        pk: AttributeValue::B(Blob::new(cuid.clone())),
-                                        sk: AttributeValue::S(r_sk),
-                                        tuid: ovbs_ppg[e.ovb_idx].clone(),
-                                    };
-                                    e.rvse.push(r);
-                                }
                             }
                         }
                     }

@@ -9,7 +9,6 @@ pub use block::{
     PARENT, PK, S, SB, SK, SK_, SN, SS, TUID, TY, XF,
 };
 
-#[macro_use]
 use std::collections::{HashMap, HashSet};
 //use std::borrow::Cow;
 use std::convert::TryFrom;
@@ -637,7 +636,7 @@ impl<'a> IntoIterator for &'a NodeType {
     type Item = &'a block::AttrD;
     type IntoIter = Iter<'a, block::AttrD>;
 
-    fn into_iter(self) -> Iter<'a, block::AttrD> {
+    fn into_iter(self) -> Self::IntoIter {//Iter<'a, block::AttrD> {
         if let None = self.attrs {
             println!(
                 "IntoIterator error: type {} [{}] has no attrs",
