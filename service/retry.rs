@@ -290,6 +290,8 @@ pub fn start_service(
                             while let Some(items) = read_rx.recv().await {
 
                                 for hm in items.unwrap() {
+                                // let mut i = items.unwrap().into_iter();
+                                // while let Some(hm) = i.next() {
 
                                     let mut put =  aws_sdk_dynamodb::types::PutRequest::builder();
                                     for (k,v) in hm {
