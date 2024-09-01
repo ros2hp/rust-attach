@@ -64,6 +64,24 @@ use uuid::{self, Builder, Uuid}; //, as_vec_string};
 
 // aws_sdk_dynamodb type conversion from AttributeValue to Rust type
 
+pub fn as_string_trim_graph(val: AttributeValue) -> Option<String> {
+    match val {
+       AttributeValue::S(s) => {let s_ = match s.split('|').last() {
+                                    Some(t) => t.to_owned() ,
+                                    None => s,
+                                  };
+                                  Some(s_)
+                                },
+       AttributeValue::Null(b) => { 
+            if b == false {
+                panic!("Got Null with bool of false")
+            }
+            None
+        },
+       _ => panic!("as_string(): Expected AttributeValue::S or ::NULL"),
+    }
+}
+
 
 pub fn as_string(val: AttributeValue) -> Option<String> {
     match val {
@@ -636,7 +654,7 @@ impl<'a> IntoIterator for &'a NodeType {
     type Item = &'a block::AttrD;
     type IntoIter = Iter<'a, block::AttrD>;
 
-    fn into_iter(self) -> Self::IntoIter {//Iter<'a, block::AttrD> {
+    fn into_iter(self) -> Iter<'a, block::AttrD> {
         if let None = self.attrs {
             println!(
                 "IntoIterator error: type {} [{}] has no attrs",
@@ -794,12 +812,10 @@ impl From<HashMap<String, AttributeValue>> for NodeType {
                             }
                         },
                 "OvBs" => {},
-                "Ty" => {
-                        match as_string(v) {
-                            Some(s) => {ty.short=s},
-                            None => panic!("From AV for NodeType Ty, expected string got Null")
-                        }
-                        },
+                "Ty" => match as_string(v) {
+                    Some(s) => ty.short = s,
+                    None => panic!("From AV for NodeType Ty, expected string got Null"),
+                },
                 _ => panic!("NodeType from impl: unexpected attribute got [{}]", k),
             }
         }

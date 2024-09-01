@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::env;
 use std::string::String;
 //use std::sync::Arc;
+use std::process::exit;
 
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::builders::PutRequestBuilder;
@@ -34,7 +35,7 @@ const OV_BLOCK_UID: u8 = 4; // this entry represents an overflow block. Current 
 const OV_BATCH_MAX_SIZE: u8 = 5; // overflow batch reached max entries - stop using. Will force creating of new overflow block or a new batch.
 const _EDGE_FILTERED: u8 = 6; // set to true when edge fails GQL uid-pred  filter
 const DYNAMO_BATCH_SIZE: usize = 25;
-const MAX_TASKS: usize = 6;
+const MAX_TASKS: usize = 1;
 
 const LS: u8 = 1;
 const LN: u8 = 2;
@@ -144,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         env::var("MYSQL_DBNAME").expect("env variable `MYSQL_DBNAME` should be set in profile");
     let graph =
         env::var("GRAPH_NAME").expect("env variable `GRAPH_NAME` should be set in profile");
-    let table_name = "RustGraph.dev.3";
+    let table_name = "RustGraph.dev.4";
     // ===========================
     // 2. Create a Dynamodb Client
     // ===========================
@@ -259,6 +260,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     // ==============================================================
     for puid in parent_node {
         // ------------------------------------------
+        
+        // if puid.to_string() != "8d18653f-bf9d-4781-ad64-28385678fb88" { // Peter Sellers in RustGraph.dev.4
+        //     continue
+        // }
         let mut p_sk_edges = match parent_edges.remove(&puid) {
             None => {
                 panic!("logic error. No entry found in parent_edges");
@@ -365,9 +370,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                         e.nd.push(AttributeValue::B(Blob::new(cuid.clone())));
                         e.xf.push(AttributeValue::N(CHILD_UID.to_string()));
                         e.id.push(0);
+
                         // reverse edge - only for non-reference nodes  and where no reverse edge exists in child type
                         // e.g. parent has type attribute "director.film" & film type has attribute "film.director" then
-                        // no need to add a reverse edge as data model has reverse explicit edge defined and it will be in the data.
+                        // no need to add a reverse edge as data model has explicit edge defined and it will be in the data.
                         // However if child type has no "film.director" attribute name then add reverse edge to child
                         // When creating an reverse edge need to decide if is a 1:1 or 1:M.
                         // if !child_ty.is_reference() && child_ty.has_no_explicit_reverse_edge(p_sk) {
@@ -396,8 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                     xf: vec![AttributeValue::N(CHILD_UID.to_string())],
                                 }]);
                                 e.ovb_idx = 0;
-
-                                // reverse edge - used to update xf in parent edge when child is deleted
+                                // reverse edge?
                             } else {
                                 // add data to current batch until max batch size reached. After max batch size reached create new batch
                                 // until max batch threshold reached in which case create new ovb
@@ -410,7 +415,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                     batch.nd.push(AttributeValue::B(Blob::new(cuid.to_owned())));
                                     batch.xf.push(AttributeValue::N(CHILD_UID.to_string()));
 
-                                    // reverse edge
                                 } else {
                                     // max batch size reaced - creat new batch - check thresholds first though
                                     // as new batch may be added to ovb on rr basis.
@@ -430,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                             xf: vec![AttributeValue::N(CHILD_UID.to_string())],
                                         });
                                         e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize] += 1;
-                                        // reverse edge
+                                        // reverse edge?    
                                     } else {
                                         let cur_batch_idx = e.ovbs[e.ovb_idx].len() - 1;
                                         let ovbuid =
@@ -446,8 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                                 xf: vec![AttributeValue::N(CHILD_UID.to_string())],
                                             });
                                             e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize] += 1;
-
-                                            // reverse edge
+                                            // reverse edge? 
                                         } else {
                                             // no more batches allowed in latest ovb. Create new ovb and add batch
                                             let ovbuid = Uuid::new_v4();
@@ -466,7 +469,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                             }]);
                                             // move to next ovb when adding next batch
                                             e.ovb_idx += 1;
-                                            // reverse edge
+                                            // reverse edge?
                                         }
                                     }
                                 }
@@ -474,7 +477,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                         } else {
                             // no more ovbs allowed. keep using current ovb (ovb_idx) until current batch full
                             // add to last batch in this ovb.
-                            let cur_batch_idx = e.ovbs[e.ovb_idx].len() - 1; 
+                                
+                            let mut cur_batch_idx = e.ovbs[e.ovb_idx].len() - 1; 
 
                             if e.ovbs[e.ovb_idx].get(cur_batch_idx).unwrap().nd.len()
                                 < OV_MAX_BATCH_SIZE
@@ -492,6 +496,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                 if e.ovb_idx == MAX_OV_BLOCKS {
                                     e.ovb_idx = 0;
                                 }
+                                cur_batch_idx = e.ovbs[e.ovb_idx].len() - 1;
+
                                 let ovbuid = e.ovbs[e.ovb_idx].get(cur_batch_idx).unwrap().pk;
                                 e.ovbs[e.ovb_idx].push(OvBatch {
                                     pk: ovbuid,
@@ -499,7 +505,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
                                     xf: vec![AttributeValue::N(CHILD_UID.to_string())],
                                 });
                                 e.id[e.ovb_idx + EMBEDDED_CHILD_NODES as usize] += 1;
-
                                 // reverse edge
                             }
                         }
@@ -575,13 +580,13 @@ async fn persist(
     for (sk, v) in items {
         match v {
             Operation::Attach(e) => {
-                println!("Persist Operation::Attach");
+                //println!("Persist Operation::Attach");
 
                 let mut id_av: Vec<AttributeValue> = vec![];
                 for i in e.id {
                     id_av.push(AttributeValue::N(i.to_string()));
                 }
-                println!("Persist Operation::Attach - id len {}", id_av.len());
+                //println!("Persist Operation::Attach - id len {}", id_av.len());
 
                 let put = aws_sdk_dynamodb::types::PutRequest::builder();
                 let put = put
@@ -597,15 +602,15 @@ async fn persist(
                 bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put, table_name).await;
 
                 // reverse edge items - only for non-reference type
-                for r in e.rvse {
-                    let put = aws_sdk_dynamodb::types::PutRequest::builder();
-                    let put = put
-                        .item(types::PK, r.pk)
-                        .item(types::SK, r.sk)
-                        .item(types::TUID, r.tuid);
+                // for r in e.rvse {
+                //     let put = aws_sdk_dynamodb::types::PutRequest::builder();
+                //     let put = put
+                //         .item(types::PK, r.pk)
+                //         .item(types::SK, r.sk)
+                //         .item(types::TUID, r.tuid);
 
-                    bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put, table_name).await;
-                }
+                //     bat_w_req = save_item(&dyn_client, bat_w_req, retry_ch, put, table_name).await;
+                // }
 
                 for ovb in e.ovbs {
                     let mut batch: usize = 1;
@@ -672,7 +677,7 @@ async fn fetch_node_type<'a, T: Into<String>>(
         .table_name(table_name)
         .key(types::PK, AttributeValue::B(Blob::new(uid.clone())))
         .key(types::SK, AttributeValue::S(sk_for_type.clone()))
-        .projection_expression("Ty")
+        .projection_expression("TyIx")
         .send()
         .await;
 
@@ -682,11 +687,11 @@ async fn fetch_node_type<'a, T: Into<String>>(
             err
         )
     }
-    let nd: types::NodeType = match result.unwrap().item {
+    let di: types::DataItem = match result.unwrap().item {
         None => panic!("No type item found in fetch_node_type() for [{}] [{}]", uid, sk_for_type),
         Some(v) => v.into(),
     };
-    node_types.get(&nd.short_nm())
+    node_types.get(&di.tyix.unwrap())
 }
 
 async fn save_item(

@@ -15,15 +15,22 @@ use std::{env, path::PathBuf};
 //use std::sync::{LockResult,MutexGuard};
 //use std::io::{Error};//,ErrorKind};
 //
+<<<<<<< HEAD
 use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemError;
+=======
+// use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemError;
+>>>>>>> 17ee935 (fix to round-robin)
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::types::WriteRequest;
 use aws_sdk_dynamodb::Client as DynamoClient;
 //
+<<<<<<< HEAD
 // use crate::aws_smithy_runtime_api::client::result::SdkError;
 // use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 //
+=======
+>>>>>>> 17ee935 (fix to round-robin)
 //use clap::Parser;
 //use aws_sdk_dynamodb::{Error};
 use tokio::sync::oneshot;
@@ -230,6 +237,7 @@ pub fn start_service(
                         });
 
                         let load_task = tokio::spawn(async move {
+<<<<<<< HEAD
                             println!("retry load_task started...");
                             loop {
 
@@ -276,6 +284,39 @@ pub fn start_service(
                                 }
                             }
 
+=======
+                            println!("retry service started...");
+
+                            while let Some(items) = read_rx.recv().await {
+
+                                for hm in items.unwrap() {
+
+                                    let mut put =  aws_sdk_dynamodb::types::PutRequest::builder();
+                                    for (k,v) in hm {
+                                        put = put.item(k,v);
+                                    }
+
+                                    // build a WriteRequest
+                                    match put.build() {
+                                        Err(err) => {
+                                            println!("error in write_request builder: {}",err);
+                                        }
+
+                                        Ok(req) =>  {
+                                            bat_w_req.push(WriteRequest::builder().put_request(req).build());
+                                        }
+                                    }
+                                    retry_items+=1;
+                                    println!("load_task: items ...{} ",bat_w_req.len());
+
+                                    // persist write requests only when dynamodb batch limit reached (25 writerequests).
+                                    if bat_w_req.len() == DYNAMO_BAT_SIZE {
+                                        bat_w_req = persist_dynamo_batch(&dynamo_client4, bat_w_req, &retry_ch, &table_name).await;
+                                    }
+                                }
+                            }
+                            println!("channel closed....shutdown retry service");
+>>>>>>> 17ee935 (fix to round-robin)
                             while bat_w_req.len() > 0 {
                                 bat_w_req = persist_dynamo_batch(&dynamo_client4, bat_w_req, &retry_ch, &table_name).await;
                             }
@@ -337,7 +378,10 @@ async fn persist_dynamo_batch(
                 // in the case of this single-table-design, unprocessed items will
                 // be associated with one table
                 for (_, v) in resp.unprocessed_items.unwrap() {
+<<<<<<< HEAD
 
+=======
+>>>>>>> 17ee935 (fix to round-robin)
                     sleep(Duration::from_millis(5000)).await;
 
                     let new_bat_w_req: Vec<WriteRequest> = v;
@@ -354,4 +398,7 @@ async fn persist_dynamo_batch(
 
     new_bat_w_req
 }
+<<<<<<< HEAD
 
+=======
+>>>>>>> 17ee935 (fix to round-robin)

@@ -3,7 +3,7 @@
 use super::{
     as_blob2, as_bool,  as_float2, as_i16, as_i16_2, as_i32_2, as_i8_2, as_int2, as_lb2,
     as_lblob2, as_lbool2, as_ldt2, as_lfloat2, as_li16_2, as_li32_2, as_li8_2, as_lint2, as_ln2,
-    as_ls2, as_luuid, as_string, as_uuid, as_vi32, as_vi8, as_n,
+    as_ls2, as_luuid, as_string, as_uuid, as_vi32, as_vi8, as_n,as_string_trim_graph,
 };
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::{any::Any, collections::HashMap};
@@ -57,8 +57,9 @@ pub const LBL: &str = "LBl";
 pub const LDT: &str = "LDT";
 // overflow
 pub const OP: &str = "OP"; // overflow parent UUID
-                           // reverse
+pub const COMMENT: &str = "Comment";                                  
 pub const TUID: &str = "TUID";
+pub const TYIX: &str = "TyIx";
 
 #[derive(Debug)]
 pub struct SK_(pub String);
@@ -145,6 +146,7 @@ pub struct DataItem {
     // double propagation
     // reverse edge
     pub tuid: Option<Uuid>,
+    pub tyix: Option<String>,
 }
 
 impl DataItem {
@@ -195,6 +197,7 @@ impl DataItem {
             op: None,
             // reverse
             tuid: None,
+            tyix: None,
         }
     }
 
@@ -419,6 +422,9 @@ impl From<HashMap<String, AttributeValue>> for DataItem {
                 OP => {
                     di.op = as_uuid(v);
                 } // parent UID in overflow blocks
+                TYIX => {
+                    di.tyix = as_string_trim_graph(v);
+                }
                 _ => panic!("unexpected attribute name in DataItem From impl [{}]", k),
             }
         }
@@ -486,6 +492,7 @@ impl From<HashMap<String, AttributeValue>> for AttrItem {
                 //"Sz" => item.sz = as_string(v),
                 "Ix" => item.ix = as_string(v),
                 "IncP" => println!("IncP not used..."),
+                COMMENT => {},
                 &_ => panic!("unexpected attribute name in AttrItem From impl [{}]", k),
             }
         }
