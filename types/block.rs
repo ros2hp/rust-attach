@@ -61,6 +61,14 @@ pub const COMMENT: &str = "Comment";
 pub const TUID: &str = "TUID";
 pub const TYIX: &str = "TyIx";
 
+// XF values
+pub const CHILD: i8 = 1;
+pub const CHILD_INUSE: i8 = 2;
+pub const CHILD_DETACHED: i8 = 3;
+pub const OVB_: i8 = 4;
+pub const OVB_INUSE: i8 = 5;
+pub const OVB_THRESHOLD_HIT: i8 = 6;
+
 #[derive(Debug)]
 pub struct SK_(pub String);
 

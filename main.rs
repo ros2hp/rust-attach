@@ -277,7 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         let dyn_client = dynamo_client.clone();
         let retry_ch = retry_send_ch.clone();
         let graph_sn = graph_prefix_wdot.trim_end_matches('.').to_string();
-        let node_types = node_types.clone();        // Arc instance - single cache in heap storage
+        let node_types = Arc::clone(&node_types);        // Arc instance - single cache in heap storage
        
         tasks += 1;     // concurrent task counter
         // =========================================
